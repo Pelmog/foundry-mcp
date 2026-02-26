@@ -140,12 +140,16 @@ export function registerDocumentTools(server) {
         'Args:\n' +
         '  - type: Document type (Actor, Item, JournalEntry, etc.)\n' +
         '  - data: Document data object (must include "name" at minimum)\n' +
+        '  - parent: Optional parent document UUID for embedded documents (e.g. "Actor.abc123" to create an Item on an Actor)\n' +
         '  - pack: Optional compendium pack ID\n\n' +
         'Returns: The created document with its assigned _id',
       inputSchema: {
         type: DocumentTypeEnum.describe('Document type to create'),
         data: z.record(z.any()).describe(
           'Document data. Must include "name". For typed docs, include "type" (e.g. Actor type="character").'
+        ),
+        parent: z.string().optional().describe(
+          'Parent document UUID for embedded documents (e.g. "Actor.abc123" to create an Item on an Actor)'
         ),
         pack: z.string().optional().describe('Compendium pack ID'),
       },
@@ -156,11 +160,12 @@ export function registerDocumentTools(server) {
         openWorldHint: false,
       },
     },
-    async ({ type, data, pack }) => {
+    async ({ type, data, parent, pack }) => {
       try {
+        const operation = { data: [data], pack: pack || null };
+        if (parent) operation.parentUuid = parent;
         const result = await foundrySocket.modifyDocument(
-          'create', type,
-          { data: [data], pack: pack || null }
+          'create', type, operation
         );
         const created = Array.isArray(result) ? result[0] : result;
         return {
