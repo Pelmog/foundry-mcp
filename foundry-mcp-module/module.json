@@ -1,0 +1,20 @@
+{
+  "id": "foundry-mcp-bridge",
+  "title": "Foundry MCP Bridge",
+  "description": "Thin socket relay for the Foundry MCP Server. Executes JavaScript sent by the MCP server in the browser context.",
+  "version": "1.0.0",
+  "compatibility": {
+    "minimum": "12",
+    "verified": "13",
+    "maximum": "13"
+  },
+  "authors": [
+    {
+      "name": "Gordon McLennan"
+    }
+  ],
+  "esmodules": [
+    "scripts/mcp-bridge.mjs"
+  ],
+  "socket": true
+}
