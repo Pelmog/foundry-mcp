@@ -279,13 +279,24 @@ List all documents of a given type.
 Always includes `_id` and `name`. Use `fields` to limit response size.
 
 #### `foundry_create`
-Create a new document.
+Create a new document. Supports both world-level and embedded documents.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `type` | string | Yes | Document type |
 | `data` | object | Yes | Document data (must include `name`) |
+| `parent` | string | No | Parent document UUID for embedded documents |
 | `pack` | string | No | Compendium pack ID |
+
+Use `parent` to create embedded documents on a parent (e.g., adding Items to an Actor):
+
+```
+type: "Item"
+data: {"name": "Phaser", "type": "characterweapon2e", ...}
+parent: "Actor.WW37bijK9ETtaNep"
+```
+
+Without `parent`, documents are created at the world level. Multiple embedded items can also be created in a single socket call by passing multiple items in the `data` array (see the source code for batch operations).
 
 #### `foundry_update`
 Update an existing document (partial update — only include changed fields).
