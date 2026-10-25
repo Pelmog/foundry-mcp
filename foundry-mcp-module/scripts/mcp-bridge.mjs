@@ -18,9 +18,16 @@ Hooks.once('ready', () => {
 
   console.log(`${MODULE_ID} | Ready — listening for MCP requests`);
 
-  game.socket.on(`module.${MODULE_ID}`, async (data) => {
+  game.socket.on(`module.${MODULE_ID}`, async (data, senderId) => {
     // Only handle exec-js requests (ignore result messages from ourselves)
     if (data?.type !== 'exec-js' || !data?.requestId) return;
+
+    // The server attaches the sender's user id; any logged-in player can emit on this
+    // channel, so only execute requests that come from a GM user.
+    if (!game.users.get(senderId)?.isGM) {
+      console.warn(`${MODULE_ID} | Rejected exec-js from non-GM sender ${senderId}`);
+      return;
+    }
 
     console.log(`${MODULE_ID} | exec-js request: ${data.requestId}`);
 
