@@ -32,7 +32,7 @@ if systemctl is-active --quiet foundry-headless-gm.service; then
 fi
 install -d -m 0755 "$target_dir" "$target_dir/lib"
 if [[ "$source_dir" != "$target_dir" ]]; then
-  for file in package.json package-lock.json headless-gm.mjs README.md foundry-headless-gm.service; do
+  for file in package.json package-lock.json headless-gm.mjs README.md foundry-headless-gm.service apparmor-foundry-headless-gm-chromium; do
     install -m 0644 "$source_dir/$file" "$target_dir/$file"
   done
   install -m 0755 "$source_dir/install.sh" "$target_dir/install.sh"
@@ -44,6 +44,12 @@ cd -- "$target_dir"
 export PLAYWRIGHT_BROWSERS_PATH=/opt/foundry-headless-gm/browsers
 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --omit=dev
 npx playwright install --with-deps chromium-headless-shell
+# Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1, which breaks
+# Chromium's sandbox. Grant userns to this binary only (same shape as the stock chrome profile).
+if [[ -d /etc/apparmor.d ]] && command -v apparmor_parser >/dev/null; then
+  install -m 0644 "$source_dir/apparmor-foundry-headless-gm-chromium" /etc/apparmor.d/foundry-headless-gm-chromium
+  apparmor_parser -r /etc/apparmor.d/foundry-headless-gm-chromium
+fi
 install -d -o foundry-gm -g foundry-gm -m 0750 /var/lib/foundry-gm
 chown -R foundry-gm:foundry-gm /var/lib/foundry-gm
 install -m 0644 "$target_dir/foundry-headless-gm.service" /etc/systemd/system/foundry-headless-gm.service

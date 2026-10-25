@@ -205,3 +205,10 @@ setup-redirect blocking, sandbox launch configuration and password redaction.
 They do not establish actual Foundry login, Chromium memory usage, Ubuntu library
 availability or host sandbox compatibility. Run the supervised `--once` smoke
 test on the host before relying on it for mutations.
+
+## Chromium sandbox on Ubuntu 24.04 (AppArmor)
+
+Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, so Chromium's sandbox fails with
+"Chromium sandboxing failed!" when it launches. `install.sh` installs `apparmor-foundry-headless-gm-chromium` to
+`/etc/apparmor.d/` and loads it. The profile grants `userns` to the Playwright `chrome-headless-shell`
+binary only (glob over the version directory). The sandbox stays on; don't "fix" this with `--no-sandbox`.

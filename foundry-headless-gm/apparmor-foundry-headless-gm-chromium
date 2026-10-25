@@ -1,0 +1,11 @@
+# Lets Playwright chrome-headless-shell for foundry-headless-gm create the user
+# namespaces its sandbox needs, which Ubuntu 24.04 restricts by default
+# (kernel.apparmor_restrict_unprivileged_userns=1). Same shape as the stock chrome profile.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile foundry-headless-gm-chromium /opt/foundry-headless-gm/browsers/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell flags=(unconfined) {
+  userns,
+
+  include if exists <local/foundry-headless-gm-chromium>
+}
