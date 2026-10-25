@@ -1,0 +1,40 @@
+[Unit]
+Description=Foundry VTT supervised headless GM client
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=foundry-gm
+Group=foundry-gm
+WorkingDirectory=/opt/foundry-headless-gm
+EnvironmentFile=/etc/foundry-headless-gm.env
+Environment=NODE_ENV=production
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/foundry-headless-gm/browsers
+Environment=HOME=/var/lib/foundry-gm
+Environment=XDG_CACHE_HOME=/var/lib/foundry-gm/cache
+Environment=XDG_CONFIG_HOME=/var/lib/foundry-gm/config
+Environment=FOUNDRY_GM_STATE_DIR=/var/lib/foundry-gm
+ExecStart=/usr/bin/node /opt/foundry-headless-gm/headless-gm.mjs
+RuntimeDirectory=foundry-gm
+RuntimeDirectoryMode=0750
+StateDirectory=foundry-gm
+StateDirectoryMode=0750
+UMask=0007
+Restart=always
+RestartSec=15s
+TimeoutStopSec=45s
+KillMode=control-group
+MemoryMax=1200M
+OOMPolicy=stop
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/foundry-gm /run/foundry-gm
+ProtectHome=true
+PrivateTmp=true
+# Chromium needs user namespaces and its own seccomp setup. Do not add
+# RestrictNamespaces, PrivateUsers, or a generic SystemCallFilter here.
+
+[Install]
+WantedBy=multi-user.target
