@@ -3,9 +3,10 @@
  */
 
 import { z } from 'zod';
-import { foundrySocket } from '../foundry-socket.mjs';
+import { foundrySocket as defaultSocket } from '../foundry-socket.mjs';
+import { browserCall as defaultBrowserCall } from '../gm-client.mjs';
 
-export function registerFileTools(server) {
+export function registerFileTools(server, { socket = defaultSocket, browserCall = defaultBrowserCall } = {}) {
   server.registerTool(
     'foundry_files',
     {
@@ -15,7 +16,7 @@ export function registerFileTools(server) {
         'Args:\n' +
         '  - path: Directory path to browse (default "/")\n' +
         '  - source: Storage source — "data" (user data), "public" (core assets)\n\n' +
-        'Returns: Directory listing with files and subdirectories',
+        'Returns: Directory listing with files and subdirectories, and "via" (socket|worker|relay)',
       inputSchema: {
         path: z.string().default('/').describe('Directory path to browse'),
         source: z.enum(['data', 'public']).default('data').describe('Storage source'),
@@ -29,22 +30,28 @@ export function registerFileTools(server) {
     },
     async ({ path, source }) => {
       try {
-        // Use exec-js to access FilePicker.browse which is browser-only
+        // Same request FilePicker.browse sends: manageFiles(data, options, callback)
+        let socketError;
+        try {
+          const r = await socket.emitWithAck(
+            'manageFiles', { action: 'browseFiles', storage: source, target: path }, {}
+          );
+          return filesResult({ target: r.target, dirs: r.dirs, files: r.files }, 'socket');
+        } catch (err) {
+          socketError = err;
+        }
+
+        // Socket refused or unavailable: browse from a GM browser client instead
         const script = `
-          const result = await FilePicker.browse("${source}", "${path.replace(/"/g, '\\"')}");
-          return {
-            target: result.target,
-            dirs: result.dirs,
-            files: result.files,
-          };
+          const result = await FilePicker.browse(${JSON.stringify(source)}, ${JSON.stringify(path)});
+          return { target: result.target, dirs: result.dirs, files: result.files };
         `;
-        const result = await foundrySocket.execJs(script);
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify(result, null, 2),
-          }],
-        };
+        try {
+          const { result, via } = await browserCall('exec', { script });
+          return filesResult(result, via);
+        } catch (browserErr) {
+          throw new Error(`socket: ${socketError.message}; browser: ${browserErr.message}`);
+        }
       } catch (err) {
         return {
           content: [{ type: 'text', text: `File browse error: ${err.message}` }],
@@ -53,4 +60,13 @@ export function registerFileTools(server) {
       }
     }
   );
+}
+
+function filesResult(listing, via) {
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({ ...listing, via }, null, 2),
+    }],
+  };
 }

@@ -6,7 +6,8 @@
   "main": "server.mjs",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node test/smoke-test.mjs"
+    "test": "node test/smoke-test.mjs",
+    "test:unit": "node --test test/unit/"
   },
   "engines": {
     "node": ">=18"

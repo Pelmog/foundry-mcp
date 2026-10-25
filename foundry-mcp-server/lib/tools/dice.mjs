@@ -3,9 +3,9 @@
  */
 
 import { z } from 'zod';
-import { foundrySocket } from '../foundry-socket.mjs';
+import { browserCall as defaultBrowserCall } from '../gm-client.mjs';
 
-export function registerDiceTools(server) {
+export function registerDiceTools(server, { browserCall = defaultBrowserCall } = {}) {
   server.registerTool(
     'foundry_roll',
     {
@@ -15,7 +15,7 @@ export function registerDiceTools(server) {
         'Args:\n' +
         '  - formula: Dice formula (e.g. "2d20kl", "4d6+2", "1d100")\n' +
         '  - flavor: Optional label for the roll\n\n' +
-        'Returns: Roll result with total, individual dice, and formula',
+        'Returns: Roll result with total, individual dice, formula, and "via" (worker|relay)',
       inputSchema: {
         formula: z.string().describe('Dice formula (e.g. "2d20", "4d6kh3+2", "2d6+1d8")'),
         flavor: z.string().optional().describe('Label/description for the roll'),
@@ -29,24 +29,12 @@ export function registerDiceTools(server) {
     },
     async ({ formula, flavor }) => {
       try {
-        // Use exec-js to roll dice in the browser context where the Roll class is available
-        const script = `
-          const roll = await new Roll("${formula.replace(/"/g, '\\"')}").evaluate();
-          ${flavor ? `roll.toMessage({ flavor: "${flavor.replace(/"/g, '\\"')}" });` : ''}
-          return {
-            formula: roll.formula,
-            total: roll.total,
-            dice: roll.dice.map(d => ({
-              faces: d.faces,
-              results: d.results.map(r => ({ result: r.result, active: r.active }))
-            }))
-          };
-        `;
-        const result = await foundrySocket.execJs(script);
+        // Rolled in a GM browser client, where Foundry's Roll class is available
+        const { result, via } = await browserCall('roll', { formula, flavor, toChat: !!flavor });
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify(result, null, 2),
+            text: JSON.stringify({ ...result, via }, null, 2),
           }],
         };
       } catch (err) {

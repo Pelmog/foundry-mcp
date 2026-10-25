@@ -67,6 +67,35 @@ registerMacroTools(server);
 // Register resources
 registerWorldResource(server);
 
+// ── Shutdown ─────────────────────────────────────────────────
+// Over SSH the client going away only closes stdin; socket.io's reconnect timers
+// would otherwise keep this process alive as an orphan holding a GM socket.
+let stopping = false;
+function shutdown(reason, code = 0) {
+  if (stopping) return;
+  stopping = true;
+  log('Shutting down:', reason);
+  const deadline = setTimeout(() => process.exit(code), 1500);
+  deadline.unref();
+  try {
+    foundrySocket.disconnect();
+  } finally {
+    process.exit(code);
+  }
+}
+
+process.stdin.once('end', () => shutdown('stdin end'));
+process.stdin.once('close', () => shutdown('stdin close'));
+process.stdin.once('error', (err) => shutdown(`stdin error: ${err.code || err.message}`, 1));
+process.stdout.on('error', (err) => shutdown(`stdout error: ${err.code || err.message}`, 1));
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.once(signal, () => shutdown(signal));
+}
+// Belt and braces: if the SSH session dies without an EOF we get re-parented to init.
+setInterval(() => {
+  if (process.ppid === 1) shutdown('parent exited');
+}, 30000).unref();
+
 // ── Startup ──────────────────────────────────────────────────
 async function main() {
   // Validate config
@@ -79,6 +108,7 @@ async function main() {
 
   // Start MCP stdio transport FIRST — Claude Code needs a quick response
   const transport = new StdioServerTransport();
+  transport.onclose = () => shutdown('transport closed');
   await server.connect(transport);
   log('MCP server running via stdio');
 
@@ -91,19 +121,6 @@ async function main() {
     log('WARNING: Failed to connect to Foundry:', err.message);
     log('Tools will return errors until connection is established.');
   }
-
-  // Graceful shutdown
-  process.on('SIGINT', () => {
-    log('Shutting down...');
-    foundrySocket.disconnect();
-    process.exit(0);
-  });
-
-  process.on('SIGTERM', () => {
-    log('Shutting down...');
-    foundrySocket.disconnect();
-    process.exit(0);
-  });
 }
 
 main().catch((err) => {

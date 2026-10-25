@@ -1,33 +1,47 @@
 # Foundry MCP Server
 
-Direct AI access to Foundry VTT via the [Model Context Protocol](https://modelcontextprotocol.io/). Connects Claude Code (or any MCP client) to a running Foundry VTT world through Socket.IO, providing 15 tools for document CRUD, search, compendium browsing, JavaScript execution, dice rolling, and more.
+Direct AI access to Foundry VTT via the [Model Context Protocol](https://modelcontextprotocol.io/). Connects Claude Code (or any MCP client) to a running Foundry VTT world through Socket.IO, providing tools for document CRUD, search, compendium browsing, JavaScript execution, dice rolling, and more. Browser-context work runs in a headless GM client, with a human GM tab as fallback.
 
 ## Architecture
 
 ```
-┌──────────────┐    stdio     ┌──────────────────┐  Socket.IO  ┌──────────────┐
-│  Claude Code │◄────────────►│  MCP Server      │◄───────────►│  Foundry VTT │
-│  (MCP Client)│    (SSH)     │  (Node.js)       │  localhost   │  (v12-v13)   │
-└──────────────┘              └──────────────────┘              └──────┬───────┘
-                                                                      │ socket relay
-                                                               ┌──────▼───────┐
-                                                               │  MCP Bridge  │
-                                                               │  (browser    │
-                                                               │   module)    │
-                                                               └──────────────┘
+Claude/Codex ──stdio/ssh──▶ MCP server (Node) ──Socket.IO (GM user)──▶ Foundry VTT
+                               │                                          ▲
+                               │ unix socket (NDJSON)                     │ browser session
+                               ▼                                          │
+                       foundry-headless-gm (Node + Playwright) ───────────┘
+                                page.evaluate → globalThis.foundryMcpBridge.dispatch()
+                               │
+                               └─ fallback when the worker isn't ready: Foundry socket relay
+                                  (channel module.foundry-mcp-bridge) → a human GM tab's bridge
 ```
 
-**Two components:**
+**Parts:**
 
-1. **`foundry-mcp-server/`** — Node.js MCP server. Authenticates with Foundry via HTTP + Socket.IO. Handles all document operations directly over the socket. Communicates with Claude Code via stdio (typically launched over SSH).
+1. **`foundry-mcp-server/`** — Node.js MCP server. Authenticates with Foundry via HTTP + Socket.IO and handles plain document operations directly over the socket. Talks to Claude Code via stdio (typically launched over SSH).
 
-2. **`foundry-mcp-module/`** — Thin Foundry VTT module (~48 lines). Installed in the browser, listens on the socket relay channel `module.foundry-mcp-bridge`. Only needed for tools that require browser context: `foundry_exec_js`, `foundry_exec_macro`, `foundry_roll`, `foundry_files`.
+2. **`foundry-mcp-module/`** — Foundry module `foundry-mcp-bridge` v2. In every **GM** client it sets `globalThis.foundryMcpBridge = {version, tabId, dispatch}`; `dispatch` supports the ops `info`, `exec`, `create`, `roll`. It also answers the socket relay for the MCP server.
+
+3. **`foundry-headless-gm/`** — a headless browser logged in as a GM user ("Friend Computer"), driven over a unix socket. It calls `foundryMcpBridge.dispatch()` for the MCP server.
+
+The full interface between these parts is in [`docs/gm-client-contract.md`](docs/gm-client-contract.md).
+
+### GM client routing
+
+Anything that needs a Foundry browser context (running scripts, rolling, creating Actors/Items with system defaults) goes through one seam, `browserCall(op, args)` in `lib/gm-client.mjs`:
+
+1. **Headless worker** — if the worker socket (`FOUNDRY_GM_SOCKET`, default `/run/foundry-gm/gm.sock`) reports `state: "ready"` in the same world the MCP server is connected to, the call goes there (`via: "worker"`). Calls are never retried: on `TIMEOUT` the call may still have run.
+2. **Relay** — otherwise the server sends `discover` over the socket relay, picks one human GM tab and sends it a `call` (`via: "relay"`).
+3. **Error** — otherwise: `No GM client available: start foundry-headless-gm on the server, or open the world as GM in a browser.`
+
+Every tool that used a GM client reports which path served it as `via`.
 
 ## Prerequisites
 
 - **Node.js** >= 18
 - **Foundry VTT** v12 or v13 (tested on v13.351)
 - **A running world** with a GM user
+- For browser-context tools: the headless GM worker (`foundry-headless-gm/`) **or** a human GM with the world open and `foundry-mcp-bridge` enabled
 - **SSH access** to the Foundry server (if remote)
 - **Claude Code** (or another MCP-compatible client)
 
@@ -41,7 +55,9 @@ foundry-mcp/
 │   ├── .env                       # Connection config (create this)
 │   ├── lib/
 │   │   ├── config.mjs             # Environment/config loader
-│   │   ├── foundry-socket.mjs     # Socket.IO client + auth
+│   │   ├── foundry-socket.mjs     # Socket.IO client + auth + relay emit/listen
+│   │   ├── gm-client.mjs          # browserCall(): worker → relay → error
+│   │   ├── join-users.mjs         # Resolve login user by name from /join
 │   │   ├── tools/
 │   │   │   ├── connection.mjs     # foundry_status
 │   │   │   ├── documents.mjs      # foundry_get, _list, _create, _update, _delete
@@ -55,12 +71,16 @@ foundry-mcp/
 │   │   └── resources/
 │   │       └── world.mjs          # foundry://world resource
 │   └── test/
-│       └── smoke-test.mjs         # Connection + CRUD smoke test
+│       ├── smoke-test.mjs         # Connection + CRUD smoke test (needs a live Foundry)
+│       └── unit/                  # node --test, no network, no Foundry
 │
-└── foundry-mcp-module/
-    ├── module.json                # Foundry module manifest
-    └── scripts/
-        └── mcp-bridge.mjs        # Browser-side exec-js relay
+├── foundry-mcp-module/
+│   ├── module.json                # Foundry module manifest (v2.0.0)
+│   └── scripts/
+│       └── mcp-bridge.mjs         # foundryMcpBridge.dispatch() + relay listener
+│
+├── foundry-headless-gm/           # Headless GM worker (Playwright)
+└── docs/gm-client-contract.md     # Interface contract between the parts
 ```
 
 ## Installation
@@ -92,16 +112,21 @@ Create a `.env` file in the `foundry-mcp-server/` directory:
 ```env
 FOUNDRY_HOST=localhost
 FOUNDRY_PORT=30000
+FOUNDRY_USER_NAME=<gm-user-name>
 FOUNDRY_USER_ID=<your-gm-user-id>
 FOUNDRY_PASSWORD=
 ```
+
+Keep comments on their own lines; the loader does not strip inline `#` comments.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `FOUNDRY_HOST` | No | `localhost` | Foundry server hostname |
 | `FOUNDRY_PORT` | No | `30000` | Foundry server port |
-| `FOUNDRY_USER_ID` | **Yes** | — | The `_id` of a GM user |
+| `FOUNDRY_USER_ID` | One of ID/NAME | — | The `_id` of a GM user. User ids differ per world |
+| `FOUNDRY_USER_NAME` | One of ID/NAME | — | The GM user's name. If `FOUNDRY_USER_ID` isn't a user in the active world, the id is resolved from this name via the `/join` page's user list, so world switches don't break login |
 | `FOUNDRY_PASSWORD` | No | `""` | User password (empty if none set) |
+| `FOUNDRY_GM_SOCKET` | No | `/run/foundry-gm/gm.sock` | Unix socket of the headless GM worker |
 
 #### Finding your GM User ID
 
@@ -160,17 +185,28 @@ If the test fails, see [Troubleshooting](#troubleshooting).
 npm test
 ```
 
-This tests config validation, socket connection, actor listing, journal CRUD (create + delete), and optionally exec-js (requires the browser module + GM logged in).
+This tests config validation, socket connection, actor listing, journal CRUD (create + delete), and optionally exec-js (requires a GM client).
 
-### Step 5: Install the Browser Module (Optional)
+Offline unit tests (no network, no Foundry) cover GM-client routing, relay sender validation, `foundry_create` routing, login-by-name parsing, the bridge module and the server's stdin-close shutdown:
 
-The browser module is **only needed** for these tools:
+```bash
+npm run test:unit
+```
+
+### Step 5: Install the Bridge Module and a GM Client
+
+Browser-context tools need a GM client. Install the module `foundry-mcp-bridge` v2 and provide one of:
+
+- the headless worker (`foundry-headless-gm/`, see its README), or
+- a human GM with the world open in a browser (relay fallback).
+
+Tools that need a GM client:
 - `foundry_exec_js` — Execute arbitrary JavaScript
 - `foundry_exec_macro` — Run a macro
 - `foundry_roll` — Roll dice via Foundry's Roll engine
-- `foundry_files` — Browse the file system via FilePicker
+- `foundry_create` for Actor, Item or anything with `parent` (unless `raw: true`)
 
-All other tools (CRUD, search, compendiums, combats, macros list) work without it.
+`foundry_files`, `foundry_packs` and `foundry_pack_contents` try the socket first and only use a GM client when the socket can't answer. All other tools work without one.
 
 **Install via symlink:**
 
@@ -191,7 +227,7 @@ Then enable the module in Foundry:
 3. Enable **Foundry MCP Bridge**
 4. Save
 
-> **Important:** The GM must be logged in with a browser for exec-js tools to work. The module runs client-side and relays script execution requests from the MCP server to the browser.
+The bridge only activates for GM users (role Assistant or above). Non-GM clients never define `foundryMcpBridge` and ignore the relay channel.
 
 ### Step 6: Register with Claude Code
 
@@ -250,7 +286,13 @@ Get connection status and world information.
 
 **Parameters:** None
 
-**Returns:** World title, system, version, users, pack count, modules.
+**Returns:** World title, system, version, users, pack count, modules, and `gmClient`:
+
+```json
+"gmClient": { "worker": { "state": "ready", "worldId": "...", "generation": 3, ... } , "relayTabs": 0 }
+```
+
+`worker` is the headless worker's status (or `null` if its socket is unreachable); `relayTabs` is the number of human GM tabs that answered a relay discover.
 
 ---
 
@@ -287,6 +329,9 @@ Create a new document. Supports both world-level and embedded documents.
 | `data` | object | Yes | Document data (must include `name`) |
 | `parent` | string | No | Parent document UUID for embedded documents |
 | `pack` | string | No | Compendium pack ID |
+| `raw` | boolean | No | Use the raw socket create (see below) |
+
+**Routing:** Actor, Item and anything with `parent` are created in a GM client (`dispatch("create")`), so system defaults and creation hooks run. If no GM client is available the tool returns an error; it never falls back silently. Pass `raw: true` to create over the socket `modifyDocument` instead; the response then carries `warning: "raw create: system defaults and creation hooks not applied"`. Other types use the socket. The response always includes `via` (`worker`, `relay` or `socket`).
 
 Use `parent` to create embedded documents on a parent (e.g., adding Items to an Actor):
 
@@ -296,7 +341,7 @@ data: {"name": "Phaser", "type": "characterweapon2e", ...}
 parent: "Actor.WW37bijK9ETtaNep"
 ```
 
-Without `parent`, documents are created at the world level. Multiple embedded items can also be created in a single socket call by passing multiple items in the `data` array (see the source code for batch operations).
+Without `parent`, documents are created at the world level.
 
 #### `foundry_update`
 Update an existing document (partial update — only include changed fields).
@@ -342,7 +387,7 @@ List all compendium packs in the world.
 
 **Parameters:** None
 
-> **Note:** Returns 0 packs when using the socket protocol's `getJoinData` response (Foundry v13 limitation). Pack operations still work if you know the pack ID.
+Reads the pack list from the `getJoinData` snapshot (top-level `packs`); if that is empty, asks a GM client. The response includes `via`.
 
 #### `foundry_pack_contents`
 List documents in a compendium pack.
@@ -353,11 +398,13 @@ List documents in a compendium pack.
 | `type` | string | Yes | Document type in the pack |
 | `full` | boolean | No | Return full documents (default: index only) |
 
+Reads over the socket first (`modifyDocument get` with `pack`), then a GM client if the socket can't. The response includes `via`.
+
 ---
 
 ### JavaScript Execution
 
-> **Requires:** `foundry-mcp-bridge` module installed + GM logged in with a browser.
+> **Requires:** a GM client (headless worker or a human GM tab with `foundry-mcp-bridge`). The response has a second text block `via: worker|relay`.
 
 #### `foundry_exec_js`
 Execute JavaScript in the Foundry browser context.
@@ -404,7 +451,7 @@ Roll dice using Foundry's Roll engine.
 | `formula` | string | Yes | Dice notation (e.g., `"2d20"`, `"4d6kh3+2"`) |
 | `flavor` | string | No | Label (if provided, posts to chat) |
 
-> **Requires:** `foundry-mcp-bridge` module (uses browser-side Roll class).
+> **Requires:** a GM client. The result includes `via`. A `flavor` posts the roll to chat.
 
 ---
 
@@ -427,7 +474,7 @@ Browse the Foundry file system.
 | `path` | string | No | Directory path (default `"/"`) |
 | `source` | string | No | `"data"` (user data) or `"public"` (core assets) |
 
-> **Requires:** `foundry-mcp-bridge` module (uses browser-side FilePicker).
+Uses the socket `manageFiles` call (`{action: "browseFiles", storage, target}`) first, then a GM client running `FilePicker.browse`. The result includes `via` (`socket`, `worker` or `relay`).
 
 ---
 
@@ -439,6 +486,16 @@ List all macros in the world (name, type, truncated command).
 **Parameters:** None
 
 ---
+
+## Security Model
+
+- **Who can run code:** only GM clients run scripts. The MCP server logs in as a GM-level user, and scripts execute with that user's Foundry permissions, either in the headless worker or in a human GM's tab.
+- **Relay messages are checked by sender.** Foundry attaches the real `senderId` to every relayed message, and any logged-in player can emit on `module.foundry-mcp-bridge`. The bridge ignores every message unless `game.users.get(senderId)?.isGM`, and the MCP server accepts a relay reply only if the sender is a GM (role ≥ 3) in the world's user list and the `requestId` is pending.
+- **Replies are targeted.** Bridge replies are emitted with `{recipients: [senderId]}`, so results aren't broadcast to every connected client.
+- **One executor.** The MCP server picks one tab from `discover` and sends a `call` naming its `tabId`; only that tab runs it.
+- **No legacy `exec-js`.** The old broadcast `{type: "exec-js"}` message is logged and ignored by the bridge, and the server no longer sends it.
+- **Worker calls aren't retried.** A timeout or a crash mid-call is reported as such; the call may have run, and a retry on another path could run it twice.
+- **Worker socket.** The IPC socket is mode 0660, owned by `foundry-gm`; the MCP server runs as root.
 
 ## Foundry v13 Protocol Details
 
@@ -503,9 +560,10 @@ socket.emit('modifyDocument', {
     title: "My World",
     system: "dnd5e",        // string, not an object
     systemVersion: "3.0.0",
-    packs: [],              // empty in getJoinData response
+    packs: [],              // usually empty; the real pack list is the top-level `packs` below
     ...
   },
+  packs: [...],             // all packs (world, system, modules)
   release: {
     generation: 13,
     build: 351,
@@ -541,20 +599,21 @@ socket.emit('modifyDocument', {
 - Test the server manually: `ssh ... "cd /path && node server.mjs --test"`
 - The MCP stdio transport must start **before** any slow operations (like connecting to Foundry). If you modify `server.mjs`, ensure `server.connect(transport)` runs before `foundrySocket.connect()`.
 
-### exec-js times out or returns errors
+### Browser tools fail with "No GM client available"
 
-- The `foundry-mcp-bridge` module must be installed **and enabled** in the world.
-- A GM user must be **logged in with a browser** — the module runs client-side.
-- Check the browser console for errors (`F12` → Console tab).
-- The module only processes requests when `game.user.isGM` is true.
+- Check `foundry_status` → `gmClient`. `worker.state` should be `ready` and `worker.worldId` should match the world.
+- If the worker is down, start `foundry-headless-gm` on the server (see its README), or open the world as a GM in a browser.
+- The `foundry-mcp-bridge` module must be installed **and enabled** in the world, at version 2.x.
+- Only GM users (role Assistant+) run the bridge; check the browser console for `foundry-mcp-bridge | Ready`.
+- A `TIMEOUT` means the call may still have run. Check before retrying.
 
-### `foundry_packs` returns 0
+### Login fails after switching worlds
 
-This is expected. Foundry v13's `getJoinData` response does not include compendium pack metadata. Pack operations (`foundry_pack_contents`, CRUD with `pack` parameter) still work if you know the pack ID. You can discover pack IDs via `foundry_exec_js`:
+User ids are per world. Set `FOUNDRY_USER_NAME` so the id is looked up on `/join` instead of relying on a stale `FOUNDRY_USER_ID`.
 
-```javascript
-return game.packs.map(p => ({id: p.metadata.id, label: p.metadata.label, type: p.metadata.type}))
-```
+### `foundry_packs` reports no packs
+
+The server reads the top-level `packs` of the `getJoinData` snapshot. If that is empty it asks a GM client, so an empty result with no GM client available is an error rather than a silent `0`.
 
 ### LevelDB errors when reading user database
 

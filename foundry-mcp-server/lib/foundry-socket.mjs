@@ -13,6 +13,10 @@
 
 import { io } from 'socket.io-client';
 import { config, getFoundryUrl } from './config.mjs';
+import { parseJoinUsers, pickUserId } from './join-users.mjs';
+
+export const RELAY_CHANNEL = 'module.foundry-mcp-bridge';
+const GM_ROLE = 3; // ASSISTANT; Foundry's User#isGM is role >= ASSISTANT
 
 const log = (...args) => console.error('[foundry-socket]', ...args);
 
@@ -23,7 +27,8 @@ export class FoundrySocket {
   #connected = false;
   #reconnectAttempts = 0;
   #maxReconnectAttempts = 5;
-  #moduleListeners = new Map(); // requestId → { resolve, reject, timer }
+  #relayListeners = new Set(); // fn(data, senderId)
+  #userId = '';
 
   get connected() { return this.#connected; }
   get worldData() { return this.#worldData; }
@@ -43,6 +48,7 @@ export class FoundrySocket {
 
     // Extract session cookie from Set-Cookie header
     const setCookie = joinPageRes.headers.get('set-cookie') || '';
+    const joinHtml = await joinPageRes.text().catch(() => '');
     const sessionMatch = setCookie.match(/session=([^;]+)/);
     if (!sessionMatch) {
       // If we got redirected to /game, the world is already active — try /game
@@ -58,6 +64,10 @@ export class FoundrySocket {
 
     log('Got session cookie');
 
+    // World switches change user ids, so re-resolve the login from the user list on /join.
+    this.#userId = pickUserId(parseJoinUsers(joinHtml), config);
+    if (this.#userId !== config.userId) log(`Resolved user "${config.userName}" -> ${this.#userId}`);
+
     // Step 2: POST /join to authenticate
     const joinRes = await fetch(`${baseUrl}/join`, {
       method: 'POST',
@@ -67,7 +77,7 @@ export class FoundrySocket {
       },
       body: JSON.stringify({
         action: 'join',
-        userid: config.userId,
+        userid: this.#userId,
         password: config.password || '',
       }),
       redirect: 'manual',
@@ -89,7 +99,7 @@ export class FoundrySocket {
       this.#sessionCookie = newSession[1];
     }
 
-    log('Authenticated as', config.userId, '— status:', joinBody?.status || joinRes.status);
+    log('Authenticated as', this.#userId, '— status:', joinBody?.status || joinRes.status);
 
     // Step 3: Connect socket.io
     await this.#connectSocket(baseUrl);
@@ -122,7 +132,7 @@ export class FoundrySocket {
       this.#socket.once('session', (sessionData) => {
         if (!sessionData?.userId) {
           clearTimeout(timeout);
-          reject(new Error('Socket session not authenticated (userId is null). Check FOUNDRY_USER_ID and FOUNDRY_PASSWORD.'));
+          reject(new Error('Socket session not authenticated (userId is null). Check FOUNDRY_USER_ID/FOUNDRY_USER_NAME and FOUNDRY_PASSWORD.'));
           return;
         }
         log('Session authenticated, userId:', sessionData.userId);
@@ -165,19 +175,11 @@ export class FoundrySocket {
         }
       });
 
-      // Listen for module bridge responses
-      this.#socket.on('module.foundry-mcp-bridge', (data) => {
-        if (data?.type === 'result' && data?.requestId) {
-          const pending = this.#moduleListeners.get(data.requestId);
-          if (pending) {
-            clearTimeout(pending.timer);
-            this.#moduleListeners.delete(data.requestId);
-            if (data.success) {
-              pending.resolve(data.result);
-            } else {
-              pending.reject(new Error(data.error || 'exec-js failed'));
-            }
-          }
+      // Relay messages from GM browser tabs. Foundry passes (data, senderId); the
+      // server attaches senderId, so listeners can trust it (but must still check it is a GM).
+      this.#socket.on(RELAY_CHANNEL, (data, senderId) => {
+        for (const fn of this.#relayListeners) {
+          try { fn(data, senderId); } catch (err) { log('Relay listener error:', err.message); }
         }
       });
     });
@@ -222,32 +224,52 @@ export class FoundrySocket {
   }
 
   /**
-   * Send a request to the foundry-mcp-bridge module running in the browser.
-   * The module executes JS in the browser context and returns the result.
-   *
-   * @param {string} script - JavaScript code to execute (use `return` for results)
-   * @param {number} [timeoutMs=30000] - Timeout in milliseconds
-   * @returns {Promise<any>}
+   * Execute a script in a GM browser client. Thin wrapper over gm-client's
+   * browserCall("exec"); kept for the test scripts. Imported lazily because
+   * gm-client imports this module.
    */
   async execJs(script, timeoutMs = 30000) {
+    const { browserCall } = await import('./gm-client.mjs');
+    return (await browserCall('exec', { script }, { timeoutMs })).result;
+  }
+
+  /** Send a relay message to the other clients (never echoed back to us). */
+  emitRelay(payload) {
+    this.#ensureConnected();
+    this.#socket.emit(RELAY_CHANNEL, payload);
+  }
+
+  /** Subscribe to relay messages as fn(data, senderId). Returns an unsubscribe function. */
+  onRelay(fn) {
+    this.#relayListeners.add(fn);
+    return () => this.#relayListeners.delete(fn);
+  }
+
+  /** True if userId is a GM (role >= 3) in the world's user list from getJoinData. */
+  isGmUser(userId) {
+    const user = (this.#worldData?.users || []).find((u) => u._id === userId);
+    return !!user && user.role >= GM_ROLE;
+  }
+
+  /**
+   * Emit an event whose server handler takes several arguments before the
+   * callback, e.g. manageFiles(data, options, callback).
+   */
+  async emitWithAck(event, ...args) {
     this.#ensureConnected();
 
-    const requestId = crypto.randomUUID();
-
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.#moduleListeners.delete(requestId);
-        reject(new Error(
-          'exec-js timed out. Ensure the foundry-mcp-bridge module is installed and a GM is logged in.'
-        ));
-      }, timeoutMs);
+      const timeout = setTimeout(() => {
+        reject(new Error(`Socket emit '${event}' timed out (30s)`));
+      }, 30000);
 
-      this.#moduleListeners.set(requestId, { resolve, reject, timer });
-
-      this.#socket.emit('module.foundry-mcp-bridge', {
-        type: 'exec-js',
-        requestId,
-        script,
+      this.#socket.emit(event, ...args, (response) => {
+        clearTimeout(timeout);
+        if (response?.error) {
+          reject(new Error(response.error.message || (typeof response.error === 'string' ? response.error : JSON.stringify(response.error))));
+        } else {
+          resolve(response);
+        }
       });
     });
   }
@@ -284,12 +306,6 @@ export class FoundrySocket {
     }
     this.#connected = false;
     this.#worldData = null;
-    // Clean up pending module requests
-    for (const [, pending] of this.#moduleListeners) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error('Disconnected'));
-    }
-    this.#moduleListeners.clear();
   }
 
   #ensureConnected() {
