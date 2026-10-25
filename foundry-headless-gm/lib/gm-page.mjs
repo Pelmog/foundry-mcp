@@ -29,15 +29,11 @@ export async function guardRoute(route, baseUrl) {
       || (request.isNavigationRequest() && !navigationAllowed(request.url(), baseUrl));
   } catch { blocked = true; }
   if (blocked) return route.abort('blockedbyclient');
-  if (!request.isNavigationRequest()) return route.continue();
-  // Playwright routing may only intercept the FIRST request in a redirect chain.
-  // Fetch navigation without following redirects and reject all redirects, so a
-  // world stopping between /api/status and /join cannot navigate to /setup.
-  const response = await route.fetch({ maxRedirects: 0, timeout: 30000 });
-  try {
-    if (response.status() >= 300 && response.status() < 400) return await route.abort('blockedbyclient');
-    await route.fulfill({ response });
-  } finally { await response.dispose(); }
+  // Navigations are not re-fetched and fulfilled here: a fulfilled response does not
+  // carry Foundry's session cookie into the page, and the v13 join UI then never
+  // loads its user list. A redirect to /setup (world stopped between /api/status and
+  // /join) is instead caught by join(), which refuses any page that is not /join.
+  return route.continue();
 }
 
 export class GmPage {
@@ -63,6 +59,8 @@ export class GmPage {
     // chromiumSandbox defaults to false in Playwright, so explicitly enable it.
     const context = await this.chromium.launchPersistentContext(join(this.stateDir, 'profile'), {
       headless: true, chromiumSandbox: true, serviceWorkers: 'block',
+      // Foundry warns below 1366x768 and may disable UI features.
+      viewport: { width: 1366, height: 768 },
       timeout: 30000,
       args: ['--disable-gpu', '--disable-dev-shm-usage', '--no-first-run', '--no-default-browser-check']
     });
@@ -113,6 +111,9 @@ export class GmPage {
       if (frame === page.mainFrame()) this.lost('GM page navigated');
     });
     await page.goto(foundryUrl(this.baseUrl, '/join'), { waitUntil: 'domcontentloaded' });
+    if (new URL(page.url()).pathname !== '/join') {
+      throw new Error(`Join page redirected to ${new URL(page.url()).pathname}; no world ready`);
+    }
     const users = page.locator('select[name="userid"]');
     await users.waitFor();
     // The v13 join UI is populated asynchronously; wait for user options to arrive.

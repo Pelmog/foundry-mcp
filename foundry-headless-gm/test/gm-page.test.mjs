@@ -6,21 +6,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { GmPage, NoUserError, guardRoute } from '../lib/gm-page.mjs';
 
-test('navigation response redirects are blocked before /setup can be fetched', async () => {
+test('navigation requests continue unmodified so the session cookie reaches the page', async () => {
   const events = [];
-  const response = { status: () => 302, dispose: async () => events.push('dispose') };
   const route = {
     request: () => ({ url: () => 'http://example.invalid/join', isNavigationRequest: () => true }),
-    fetch: async options => { assert.equal(options.maxRedirects, 0); events.push('fetch'); return response; },
-    abort: async () => events.push('abort'),
-    fulfill: async () => events.push('fulfill')
+    continue: async () => events.push('continue'),
+    abort: async () => events.push('abort')
   };
   await guardRoute(route, 'http://example.invalid');
-  assert.deepEqual(events, ['fetch', 'abort', 'dispose']);
-  events.length = 0;
-  response.status = () => 200;
-  await guardRoute(route, 'http://example.invalid');
-  assert.deepEqual(events, ['fetch', 'fulfill', 'dispose']);
+  assert.deepEqual(events, ['continue']);
 });
 
 test('direct setup navigation is aborted without any fetch', async () => {
@@ -63,7 +57,8 @@ async function fixture(t) {
     page.setDefaultTimeout = () => {};
     page.setDefaultNavigationTimeout = () => {};
     page.mainFrame = () => 'main';
-    page.goto = async url => { actions.push(url); page.emit('framenavigated', 'main'); };
+    page.goto = async url => { actions.push(url); page.currentUrl = url; page.emit('framenavigated', 'main'); };
+    page.url = () => page.currentUrl ?? 'about:blank';
     page.waitForURL = async url => actions.push(url);
     page.waitForFunction = async () => {};
     page.locator = selector => {

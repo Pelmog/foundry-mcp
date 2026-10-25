@@ -116,7 +116,7 @@ workflow. It will notice within the next 15-second watchdog tick.
 | §5 browser | One persistent context/browser, one game page; state under `/var/lib/foundry-gm/profile`. `addInitScript` sets `core.noCanvas` to the JSON text `true` before navigation. Headless-shell, disabled GPU, sandbox explicitly enabled. |
 | §5 watchdog | Immediate check, then every 15 seconds, without overlapping checks. Status HTTP timeout 5 s. No active world closes the page. World/user/readiness/socket/tab changes trigger a rejoin. Failed attempts back off 15, 30, 60, 120, 240, then 300 seconds. |
 | §5 join | `/join`, resolve `select[name="userid"] option` by exact name, fill `input[name="password"]`, click `button[name="join"]`, wait for `/game`, `game.ready` and bridge. Check identity with `info`. |
-| §5 setup exclusion | Direct setup requests are blocked. Navigation is fetched without redirect following; navigation redirects are rejected before a redirect to `/setup` can be visited. Cross-origin navigation is refused. |
+| §5 setup exclusion | Direct setup requests are blocked. Navigations continue normally (re-fetching them would drop Foundry's session cookie), and `join()` refuses any page that did not land on `/join`, so a redirect to `/setup` is never used. Cross-origin navigation is refused. |
 | §5 supervision | System user, EnvironmentFile, runtime/state directories, `Restart=always`, 15 s restart delay, `MemoryMax=1200M`, JSON stdout, `--once`. SIGTERM/INT stops acceptance, fails pending work, closes browser and connections, removes socket. |
 
 The service's socket override must point into a directory writable by `foundry-gm`.
