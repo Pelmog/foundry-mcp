@@ -38,7 +38,9 @@ export const config = {
   host: process.env.FOUNDRY_HOST || fileEnv.FOUNDRY_HOST || 'localhost',
   port: parseInt(process.env.FOUNDRY_PORT || fileEnv.FOUNDRY_PORT || '30000', 10),
   userId: process.env.FOUNDRY_USER_ID || fileEnv.FOUNDRY_USER_ID || '',
+  userName: process.env.FOUNDRY_USER_NAME || fileEnv.FOUNDRY_USER_NAME || '',
   password: process.env.FOUNDRY_PASSWORD || fileEnv.FOUNDRY_PASSWORD || '',
+  gmSocket: process.env.FOUNDRY_GM_SOCKET || fileEnv.FOUNDRY_GM_SOCKET || '/run/foundry-gm/gm.sock',
 };
 
 export function getFoundryUrl() {
@@ -46,10 +48,10 @@ export function getFoundryUrl() {
 }
 
 export function validateConfig() {
-  if (!config.userId) {
+  if (!config.userId && !config.userName) {
     throw new Error(
-      'FOUNDRY_USER_ID is required. Set it in .env or environment.\n' +
-      'Find it with: exec-js "return game.users.find(u => u.isGM)?.id"'
+      'FOUNDRY_USER_ID or FOUNDRY_USER_NAME is required. Set it in .env or environment.\n' +
+      'Find an id with: exec-js "return game.users.find(u => u.isGM)?.id"'
     );
   }
 }

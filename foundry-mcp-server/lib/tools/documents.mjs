@@ -4,6 +4,7 @@
 
 import { z } from 'zod';
 import { foundrySocket } from '../foundry-socket.mjs';
+import { browserCall as defaultBrowserCall } from '../gm-client.mjs';
 
 const DOCUMENT_TYPES = [
   'Actor', 'Item', 'JournalEntry', 'Scene', 'RollTable',
@@ -13,7 +14,11 @@ const DOCUMENT_TYPES = [
 
 const DocumentTypeEnum = z.enum(DOCUMENT_TYPES);
 
-export function registerDocumentTools(server) {
+// Creating these through the raw modifyDocument socket skips the system's data model
+// defaults and creation hooks, which produces broken sheets; so they go through a GM client.
+const BROWSER_CREATE_TYPES = new Set(['Actor', 'Item']);
+
+export function registerDocumentTools(server, { browserCall = defaultBrowserCall, socket = foundrySocket } = {}) {
 
   // ── foundry_get ────────────────────────────────────────────
   server.registerTool(
@@ -42,7 +47,7 @@ export function registerDocumentTools(server) {
     },
     async ({ type, id, pack }) => {
       try {
-        const result = await foundrySocket.modifyDocument(
+        const result = await socket.modifyDocument(
           'get', type,
           { query: { _id: id }, pack: pack || null }
         );
@@ -94,7 +99,7 @@ export function registerDocumentTools(server) {
     },
     async ({ type, fields, pack }) => {
       try {
-        const result = await foundrySocket.modifyDocument(
+        const result = await socket.modifyDocument(
           'get', type,
           { query: {}, pack: pack || null }
         );
@@ -141,8 +146,12 @@ export function registerDocumentTools(server) {
         '  - type: Document type (Actor, Item, JournalEntry, etc.)\n' +
         '  - data: Document data object (must include "name" at minimum)\n' +
         '  - parent: Optional parent document UUID for embedded documents (e.g. "Actor.abc123" to create an Item on an Actor)\n' +
-        '  - pack: Optional compendium pack ID\n\n' +
-        'Returns: The created document with its assigned _id',
+        '  - pack: Optional compendium pack ID\n' +
+        '  - raw: Create over the raw socket (modifyDocument) instead of a GM client. Only for Actor/Item/embedded ' +
+        'creates when no GM client is available; skips system defaults and creation hooks.\n\n' +
+        'Actor, Item and anything with "parent" is created in a GM client (headless worker or GM tab); without one ' +
+        'this errors rather than falling back silently.\n' +
+        'Returns: The created document with its assigned _id, and "via" (worker|relay|socket)',
       inputSchema: {
         type: DocumentTypeEnum.describe('Document type to create'),
         data: z.record(z.any()).describe(
@@ -152,6 +161,9 @@ export function registerDocumentTools(server) {
           'Parent document UUID for embedded documents (e.g. "Actor.abc123" to create an Item on an Actor)'
         ),
         pack: z.string().optional().describe('Compendium pack ID'),
+        raw: z.boolean().optional().describe(
+          'Use the raw socket create (no system defaults or creation hooks) instead of a GM client'
+        ),
       },
       annotations: {
         readOnlyHint: false,
@@ -160,18 +172,33 @@ export function registerDocumentTools(server) {
         openWorldHint: false,
       },
     },
-    async ({ type, data, parent, pack }) => {
+    async ({ type, data, parent, pack, raw }) => {
       try {
+        const needsBrowser = BROWSER_CREATE_TYPES.has(type) || !!parent;
+
+        if (needsBrowser && !raw) {
+          const { result, via } = await browserCall('create', { type, data, parent, pack });
+          const documents = result.documents;
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({ created: true, document: documents[0], documents, via }, null, 2),
+            }],
+          };
+        }
+
         const operation = { data: [data], pack: pack || null };
         if (parent) operation.parentUuid = parent;
-        const result = await foundrySocket.modifyDocument(
+        const result = await socket.modifyDocument(
           'create', type, operation
         );
         const created = Array.isArray(result) ? result[0] : result;
+        const response = { created: true, document: created, via: 'socket' };
+        if (needsBrowser) response.warning = 'raw create: system defaults and creation hooks not applied';
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify({ created: true, document: created }, null, 2),
+            text: JSON.stringify(response, null, 2),
           }],
         };
       } catch (err) {
@@ -213,7 +240,7 @@ export function registerDocumentTools(server) {
     async ({ type, id, data, pack }) => {
       try {
         const updateData = { _id: id, ...data };
-        const result = await foundrySocket.modifyDocument(
+        const result = await socket.modifyDocument(
           'update', type,
           { updates: [updateData], diff: true, pack: pack || null }
         );
@@ -259,7 +286,7 @@ export function registerDocumentTools(server) {
     },
     async ({ type, ids, pack }) => {
       try {
-        const result = await foundrySocket.modifyDocument(
+        const result = await socket.modifyDocument(
           'delete', type,
           { ids, pack: pack || null }
         );

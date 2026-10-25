@@ -1,14 +1,17 @@
 /**
  * Compendium tools: foundry_packs, foundry_pack_contents
  *
- * Uses exec-js (browser context) for pack access since module compendium packs
- * are only available in the browser, not via the server-side modifyDocument socket.
+ * Socket first (pack list from the getJoinData snapshot, modifyDocument "get" with a
+ * pack), then a GM browser client if the socket can't answer.
  */
 
 import { z } from 'zod';
-import { foundrySocket } from '../foundry-socket.mjs';
+import { foundrySocket as defaultSocket } from '../foundry-socket.mjs';
+import { browserCall as defaultBrowserCall } from '../gm-client.mjs';
 
-export function registerCompendiumTools(server) {
+const json = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
+
+export function registerCompendiumTools(server, { socket = defaultSocket, browserCall = defaultBrowserCall } = {}) {
 
   // ── foundry_packs ──────────────────────────────────────────
   server.registerTool(
@@ -29,59 +32,35 @@ export function registerCompendiumTools(server) {
     },
     async () => {
       try {
-        // Try exec-js first (works for module packs)
-        try {
-          const packs = await foundrySocket.execJs(`
-            return game.packs.map(p => ({
-              id: p.metadata.id,
-              label: p.metadata.label,
-              type: p.metadata.type,
-              system: p.metadata.system || null,
-              packageType: p.metadata.packageType,
-              packageName: p.metadata.packageName,
-              path: p.metadata.path
-            }));
-          `);
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                count: packs.length,
-                packs,
-              }, null, 2),
-            }],
-          };
-        } catch {
-          // Fallback to worldData if exec-js unavailable
+        // getJoinData carries every pack (world, system and modules) at the top level as
+        // `packs`; `world.packs` is a different, usually empty, list.
+        const worldData = socket.worldData;
+        const raw = worldData?.packs?.length ? worldData.packs : (worldData?.world?.packs || []);
+        if (raw.length) {
+          const packs = raw.map(p => ({
+            id: p.id,
+            label: p.label,
+            type: p.type,
+            system: p.system || null,
+            packageType: p.packageType,
+            packageName: p.packageName,
+            path: p.path,
+          }));
+          return json({ count: packs.length, packs, via: 'socket' });
         }
 
-        const worldData = foundrySocket.worldData;
-        if (!worldData) {
-          return {
-            content: [{ type: 'text', text: 'Not connected to Foundry VTT' }],
-            isError: true,
-          };
-        }
-
-        const packs = (worldData.world?.packs || worldData.packs || []).map(p => ({
-          id: p.id,
-          label: p.label,
-          type: p.type,
-          system: p.system || null,
-          packageType: p.packageType,
-          packageName: p.packageName,
-          path: p.path,
-        }));
-
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              count: packs.length,
-              packs,
-            }, null, 2),
-          }],
-        };
+        const { result: packs, via } = await browserCall('exec', { script: `
+          return game.packs.map(p => ({
+            id: p.metadata.id,
+            label: p.metadata.label,
+            type: p.metadata.type,
+            system: p.metadata.system || null,
+            packageType: p.metadata.packageType,
+            packageName: p.metadata.packageName,
+            path: p.metadata.path
+          }));
+        ` });
+        return json({ count: packs.length, packs, via });
       } catch (err) {
         return {
           content: [{ type: 'text', text: `Error listing packs: ${err.message}` }],
@@ -117,72 +96,45 @@ export function registerCompendiumTools(server) {
     },
     async ({ pack, type, full }) => {
       try {
-        // Try exec-js first (works for module packs)
+        let socketError;
         try {
-          const packId = pack.replace(/"/g, '\\"');
-          const script = full
-            ? `
-              const p = game.packs.get("${packId}");
-              if (!p) throw new Error("Pack not found: ${packId}");
-              const docs = await p.getDocuments();
-              return docs.map(d => d.toObject());
-            `
-            : `
-              const p = game.packs.get("${packId}");
-              if (!p) throw new Error("Pack not found: ${packId}");
-              const index = await p.getIndex();
-              return index.contents.map(d => ({
-                _id: d._id,
-                name: d.name,
-                type: d.type,
-                img: d.img
-              }));
-            `;
-
-          const docs = await foundrySocket.execJs(script);
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                pack,
-                count: docs.length,
-                documents: docs,
-              }, null, 2),
-            }],
-          };
-        } catch (execErr) {
-          // If exec-js failed with "not found", propagate that error
-          if (execErr.message?.includes('Pack not found')) throw execErr;
-          // Otherwise fall back to socket modifyDocument
+          const result = await socket.modifyDocument(
+            'get', type,
+            { query: {}, pack, ...(full ? {} : { index: true }) }
+          );
+          let docs = Array.isArray(result) ? result : [];
+          if (!full) docs = docs.map(({ _id, name, type: t, img }) => ({ _id, name, type: t, img }));
+          return json({ pack, count: docs.length, documents: docs, via: 'socket' });
+        } catch (err) {
+          socketError = err;
         }
 
-        // Fallback: socket-based access (works for world packs)
-        const result = await foundrySocket.modifyDocument(
-          'get', type,
-          { query: {}, pack }
-        );
-
-        let docs = Array.isArray(result) ? result : [];
-
-        if (!full) {
-          docs = docs.map(d => ({
-            _id: d._id,
-            name: d.name,
-            type: d.type,
-            img: d.img,
-          }));
+        // Socket couldn't read the pack: ask a GM browser client
+        const packId = JSON.stringify(pack);
+        const script = full
+          ? `
+            const p = game.packs.get(${packId});
+            if (!p) throw new Error("Pack not found: " + ${packId});
+            const docs = await p.getDocuments();
+            return docs.map(d => d.toObject());
+          `
+          : `
+            const p = game.packs.get(${packId});
+            if (!p) throw new Error("Pack not found: " + ${packId});
+            const index = await p.getIndex();
+            return index.contents.map(d => ({
+              _id: d._id,
+              name: d.name,
+              type: d.type,
+              img: d.img
+            }));
+          `;
+        try {
+          const { result: docs, via } = await browserCall('exec', { script });
+          return json({ pack, count: docs.length, documents: docs, via });
+        } catch (browserErr) {
+          throw new Error(`socket: ${socketError.message}; browser: ${browserErr.message}`);
         }
-
-        return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              pack,
-              count: docs.length,
-              documents: docs,
-            }, null, 2),
-          }],
-        };
       } catch (err) {
         return {
           content: [{ type: 'text', text: `Error reading pack "${pack}": ${err.message}` }],
