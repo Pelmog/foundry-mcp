@@ -1,5 +1,8 @@
 /**
  * Compendium tools: foundry_packs, foundry_pack_contents
+ *
+ * Uses exec-js (browser context) for pack access since module compendium packs
+ * are only available in the browser, not via the server-side modifyDocument socket.
  */
 
 import { z } from 'zod';
@@ -26,6 +29,32 @@ export function registerCompendiumTools(server) {
     },
     async () => {
       try {
+        // Try exec-js first (works for module packs)
+        try {
+          const packs = await foundrySocket.execJs(`
+            return game.packs.map(p => ({
+              id: p.metadata.id,
+              label: p.metadata.label,
+              type: p.metadata.type,
+              system: p.metadata.system || null,
+              packageType: p.metadata.packageType,
+              packageName: p.metadata.packageName,
+              path: p.metadata.path
+            }));
+          `);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                count: packs.length,
+                packs,
+              }, null, 2),
+            }],
+          };
+        } catch {
+          // Fallback to worldData if exec-js unavailable
+        }
+
         const worldData = foundrySocket.worldData;
         if (!worldData) {
           return {
@@ -34,7 +63,6 @@ export function registerCompendiumTools(server) {
           };
         }
 
-        // Packs are listed in worldData.world.packs (Foundry v13 getJoinData structure)
         const packs = (worldData.world?.packs || worldData.packs || []).map(p => ({
           id: p.id,
           label: p.label,
@@ -71,12 +99,12 @@ export function registerCompendiumTools(server) {
       description:
         'Get the index or full contents of a compendium pack.\n\n' +
         'Args:\n' +
-        '  - pack: Pack ID (e.g. "sta-compendia.talents-core")\n' +
+        '  - pack: Pack ID (e.g. "sta-compendia.general-talents-core")\n' +
         '  - full: If true, return full document data. If false (default), return index only (name, type, img).\n' +
-        '  - type: Document type in this pack (e.g. "Item", "Actor")\n\n' +
+        '  - type: Document type in this pack (e.g. "Item", "Actor", "JournalEntry")\n\n' +
         'Returns: Array of documents or index entries',
       inputSchema: {
-        pack: z.string().describe('Compendium pack ID (e.g. "sta-compendia.talents-core")'),
+        pack: z.string().describe('Compendium pack ID (e.g. "sta-compendia.general-talents-core")'),
         type: z.string().describe('Document type in this pack (e.g. "Item", "Actor", "JournalEntry")'),
         full: z.boolean().default(false).describe('Return full documents (true) or just index (false)'),
       },
@@ -89,6 +117,46 @@ export function registerCompendiumTools(server) {
     },
     async ({ pack, type, full }) => {
       try {
+        // Try exec-js first (works for module packs)
+        try {
+          const packId = pack.replace(/"/g, '\\"');
+          const script = full
+            ? `
+              const p = game.packs.get("${packId}");
+              if (!p) throw new Error("Pack not found: ${packId}");
+              const docs = await p.getDocuments();
+              return docs.map(d => d.toObject());
+            `
+            : `
+              const p = game.packs.get("${packId}");
+              if (!p) throw new Error("Pack not found: ${packId}");
+              const index = await p.getIndex();
+              return index.contents.map(d => ({
+                _id: d._id,
+                name: d.name,
+                type: d.type,
+                img: d.img
+              }));
+            `;
+
+          const docs = await foundrySocket.execJs(script);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                pack,
+                count: docs.length,
+                documents: docs,
+              }, null, 2),
+            }],
+          };
+        } catch (execErr) {
+          // If exec-js failed with "not found", propagate that error
+          if (execErr.message?.includes('Pack not found')) throw execErr;
+          // Otherwise fall back to socket modifyDocument
+        }
+
+        // Fallback: socket-based access (works for world packs)
         const result = await foundrySocket.modifyDocument(
           'get', type,
           { query: {}, pack }
@@ -96,7 +164,6 @@ export function registerCompendiumTools(server) {
 
         let docs = Array.isArray(result) ? result : [];
 
-        // If not full, return just index fields
         if (!full) {
           docs = docs.map(d => ({
             _id: d._id,

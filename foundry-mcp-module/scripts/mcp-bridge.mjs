@@ -25,7 +25,8 @@ Hooks.once('ready', () => {
     console.log(`${MODULE_ID} | exec-js request: ${data.requestId}`);
 
     try {
-      const fn = new Function(data.script);
+      const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+      const fn = new AsyncFunction(data.script);
       const result = await fn();
 
       game.socket.emit(`module.${MODULE_ID}`, {
